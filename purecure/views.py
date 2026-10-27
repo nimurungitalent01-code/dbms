@@ -6,7 +6,7 @@ from django.contrib import messages
 from django.contrib.auth.hashers import check_password
 from django.contrib.auth.hashers import make_password
 from django import forms
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Sum
 from django.db.models import Q
 from django.db.models.functions import Coalesce
@@ -382,12 +382,15 @@ def record_sale(request):
     if request.method == "POST" and form.is_valid():
         batch = form.cleaned_data["batch"]
         quantity = form.cleaned_data["quantity"]
+        sale = None
         with transaction.atomic():
-            batch = MedicineBatches.objects.select_for_update().select_related("medicine").get(pk=batch.pk)
+            # Lock just the inventory row. The lock is held until the receipt
+            # and its line item commit, so the availability check is serialized.
+            batch = MedicineBatches.objects.select_for_update().get(pk=batch.pk)
             if quantity > batch.quantity_remaining:
                 form.add_error("quantity", f"Only {batch.quantity_remaining} units remain in this batch.")
             else:
-                medicine = batch.medicine
+                medicine = Medicines.objects.get(pk=batch.medicine_id)
                 total = medicine.unit_price * quantity
                 sale = Sales.objects.create(
                     customer=form.cleaned_data["customer"], employee=request.employee,
@@ -395,8 +398,9 @@ def record_sale(request):
                 )
                 SaleItems.objects.create(sale=sale, medicine=medicine, batch=batch, quantity=quantity,
                                          unit_price=medicine.unit_price, subtotal=total)
-                messages.success(request, f"Receipt #{sale.pk} prepared. Take it to the cashier for payment.")
-                return redirect("sale_receipt", sale_id=sale.pk)
+        if sale:
+            messages.success(request, f"Receipt #{sale.pk} prepared. Take it to the cashier for payment.")
+            return redirect("sale_receipt", sale_id=sale.pk)
     return render(request, "purecure/edit_record.html", {
         "employee": request.employee, "nav_items": nav_items(request.employee.role.role_name),
         "title": "Record a sale", "table_name": "sales", "form": form,
@@ -445,13 +449,41 @@ def take_payment(request, sale_id):
         return redirect("records", table_name="sales")
     form = PaymentForm(request.POST or None, sale_total=sale_for_form.total_amount)
     if request.method == "POST" and form.is_valid():
+        # select_for_update is a no-op on backends without row-lock support.
+        # Refuse to finalize stock movements there instead of implying safety.
+        if not connection.features.has_select_for_update:
+            messages.error(request, "Payments require a database that supports row-level locking.")
+            return redirect("sale_receipt", sale_id=sale_id)
+
         with transaction.atomic():
+            # The sale row is the serialization point for competing payment
+            # attempts. A second cashier waits, then observes the committed status.
             sale = Sales.objects.select_for_update().filter(pk=sale_id).first()
             if not sale or sale.status != "Pending Payment":
                 messages.error(request, "This sale has already been completed or cannot be found.")
                 return redirect("records", table_name="sales")
+
+            if form.cleaned_data["amount_received"] < sale.total_amount:
+                form.add_error(
+                    "amount_received",
+                    f"Amount received must be at least Shs {sale.total_amount:,.2f}.",
+                )
+                return render(request, "purecure/payment.html", {
+                    "employee": request.employee,
+                    "nav_items": nav_items(request.employee.role.role_name),
+                    "sale": sale,
+                    "form": form,
+                })
+
             items = list(SaleItems.objects.filter(sale=sale).select_related("medicine", "batch"))
-            batches = {b.pk: b for b in MedicineBatches.objects.select_for_update().filter(pk__in=[i.batch_id for i in items])}
+            # Every payment locks batches in primary-key order to reduce
+            # deadlocks when a future sale can contain multiple batches.
+            batches = {
+                batch.pk: batch
+                for batch in MedicineBatches.objects.select_for_update()
+                .filter(pk__in=[item.batch_id for item in items])
+                .order_by("pk")
+            }
             for item in items:
                 batch = batches.get(item.batch_id)
                 if not batch or batch.quantity_remaining < item.quantity or batch.expiry_date < timezone.localdate():
